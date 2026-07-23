@@ -87,6 +87,76 @@ class AITranslator:
 
     DEFAULT_MODEL_NAME = "mrm8488/t5-base-finetuned-wikiSQL"
 
+    # --------------------------------------------------------------------
+    # SEMA ESLEME (SCHEMA MAPPING) SABITLERI
+    # --------------------------------------------------------------------
+    # ONEMLI SINIRLAMA:
+    #   mrm8488/t5-base-finetuned-wikiSQL, WikiSQL veri kumesiyle egitilmistir.
+    #   WikiSQL'de her soru KENDI (farkli, rastgele) tablosuna aittir ve model
+    #   gercek tablo/kolon isimlerini hic gormemistir. Bu yuzden model:
+    #     - Tablo adi olarak hep literal "table" kelimesini uretir,
+    #     - Kolon adi olarak da soruda gecen kelimeleri (buyuk harfle) aynen
+    #       kopyalar (ornegin "Employee", "Salary").
+    #   Yani model SEMADAN HABERSIZDIR (schema-agnostic).
+    #
+    #   Bu sozlukler, modelin urettigi bu "placeholder" degerleri, projemizin
+    #   GERCEK semasina (Personel, Yemekler tablolari) sezgisel (heuristic)
+    #   olarak esler. Bu %100 garantili bir cozum degildir; karmasik veya
+    #   belirsiz sorularda hala yanlis esleme olabilir, ancak yaygin ve basit
+    #   istekleri (orn. "maasi 50000'den buyuk calisanlari getir") dogru
+    #   calisir hale getirir.
+    # --------------------------------------------------------------------
+
+    DEFAULT_TABLE_NAME = "Personel"
+
+    # Dogal dildeki anahtar kelimelere gore hedef tabloyu tahmin etmek icin.
+    TABLE_KEYWORDS: dict[str, list[str]] = {
+        "Personel": [
+            "employee", "employees", "staff", "worker", "workers",
+            "personel", "calisan", "calisanlar", "personnel",
+        ],
+        "Yemekler": [
+            "food", "foods", "dish", "dishes", "meal", "meals", "menu",
+            "yemek", "yemekler", "yemegi",
+        ],
+    }
+
+    # Modelin urettigi tahmini kolon isimlerini (Ingilizce/genel terimler)
+    # projemizin gercek kolon adlarina esler. Anahtarlar kucuk harfle
+    # tutulur; eslesme case-insensitive yapilir.
+    COLUMN_SYNONYMS: dict[str, str] = {
+        # Personel tablosu
+        "salary": "maas",
+        "salaries": "maas",
+        "wage": "maas",
+        "maas": "maas",
+        "employee": "ad_soyad",
+        "employees": "ad_soyad",
+        "name": "ad_soyad",
+        "fullname": "ad_soyad",
+        "ad_soyad": "ad_soyad",
+        "department": "departman",
+        "departman": "departman",
+        "hiredate": "ise_giris_tarihi",
+        "startdate": "ise_giris_tarihi",
+        "ise_giris_tarihi": "ise_giris_tarihi",
+        # Yemekler tablosu
+        "food": "yemek_adi",
+        "dish": "yemek_adi",
+        "meal": "yemek_adi",
+        "yemek": "yemek_adi",
+        "yemek_adi": "yemek_adi",
+        "category": "kategori",
+        "kategori": "kategori",
+        "price": "fiyat",
+        "fiyat": "fiyat",
+        "calorie": "kalori",
+        "calories": "kalori",
+        "kalori": "kalori",
+        # Ortak
+        "id": "id",
+    }
+
     def __init__(self, model_name: str | None = None, max_new_tokens: int = 128) -> None:
         """
         Args:
@@ -211,6 +281,80 @@ class AITranslator:
 
         return cleaned
 
+    def _infer_target_table(self, natural_language_text: str) -> str:
+        """
+        Dogal dil girdisindeki anahtar kelimelere bakarak hedef tabloyu
+        tahmin eder.
+
+        Args:
+            natural_language_text: Kullanicinin orijinal dogal dil metni.
+
+        Returns:
+            Tahmin edilen tablo adi ("Personel" veya "Yemekler"). Hicbir
+            anahtar kelime eslesmezse DEFAULT_TABLE_NAME ("Personel") doner.
+        """
+        lowered_text = natural_language_text.lower()
+
+        for table_name, keywords in self.TABLE_KEYWORDS.items():
+            for keyword in keywords:
+                if re.search(rf"\b{re.escape(keyword)}\b", lowered_text):
+                    return table_name
+
+        return self.DEFAULT_TABLE_NAME
+
+    def _map_to_project_schema(self, natural_language_text: str, sql: str) -> str:
+        """
+        Modelin urettigi semadan-habersiz (schema-agnostic) SQL ciktisini,
+        projemizin GERCEK tablo/kolon isimlerine sezgisel olarak esler.
+
+        Bu metod iki islem yapar:
+            1. Literal "table" placeholder'ini, dogal dilden tahmin edilen
+               gercek tablo adiyla (Personel/Yemekler) degistirir.
+            2. Modelin ürettigi tahmini kolon isimlerini (orn. "Employee",
+               "Salary") COLUMN_SYNONYMS sozlugu uzerinden gercek kolon
+               adlarina (orn. "ad_soyad", "maas") cevirir.
+
+        Not: Bu bir sezgisel (heuristic) eslemedir, kesin bir semantik
+        analiz degildir. Sozlukte karsiligi olmayan kelimeler oldugu gibi
+        birakilir; bu durumda calistirma asamasinda hala hata alinabilir
+        ve kullanicinin sorguyu elle duzeltmesi gerekebilir.
+
+        Args:
+            natural_language_text: Kullanicinin orijinal dogal dil metni
+                (hedef tabloyu tahmin etmek icin kullanilir).
+            sql: Modelin uretip temizledigimiz ham SQL string'i.
+
+        Returns:
+            Sema eslemesi uygulanmis SQL string'i.
+        """
+        mapped_sql = sql
+
+        target_table = self._infer_target_table(natural_language_text)
+
+        # Literal "table" kelimesini (kelime siniri ile, buyuk/kucuk harf
+        # duyarsiz) gercek tablo adiyla degistirir.
+        mapped_sql = re.sub(
+            r"\btable\b", target_table, mapped_sql, flags=re.IGNORECASE
+        )
+
+        # Kolon isimlerini esanlamlilar sozlugu uzerinden degistirir.
+        # Uzun anahtarlardan kisaya dogru siralanir ki "employees" gibi
+        # bilesik kelimeler "employee" tarafindan yanlislikla kismen
+        # eslesmesin (word-boundary zaten bunu buyuk olcude engeller,
+        # ama uzunluk sirasi ekstra guvenlik saglar).
+        sorted_synonyms = sorted(
+            self.COLUMN_SYNONYMS.items(), key=lambda item: len(item[0]), reverse=True
+        )
+        for synonym, real_column in sorted_synonyms:
+            mapped_sql = re.sub(
+                rf"\b{re.escape(synonym)}\b",
+                real_column,
+                mapped_sql,
+                flags=re.IGNORECASE,
+            )
+
+        return mapped_sql
+
     def translate_text_to_sql(self, natural_language_text: str) -> str:
         """
         Dogal dilde yazilmis bir istegi calistirilabilir bir SQL ifadesine cevirir.
@@ -276,6 +420,11 @@ class AITranslator:
 
         if not sql_query:
             raise AITranslatorError("Model gecerli bir SQL cikisi uretemedi.")
+
+        # Model semadan habersiz oldugu icin (bkz. sinif basindaki not),
+        # uretilen "table" placeholder'ini ve tahmini kolon isimlerini
+        # projemizin gercek semasina esliyoruz.
+        sql_query = self._map_to_project_schema(natural_language_text, sql_query)
 
         return sql_query
 
