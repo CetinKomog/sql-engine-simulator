@@ -1,3 +1,40 @@
+"""
+ai_translator.py
+------------------
+Modul 4: Dogal dil (Turkce/Ingilizce) girdisini SQL sorgusuna ceviren
+"Text-to-SQL" modulu.
+
+Bu modul, kullanicinin "maasi 50000'den buyuk olanlari getir" gibi dogal
+dilde yazdigi bir istegi, yerel (local) olarak calisan hafif bir
+Hugging Face Seq2Seq modeli (varsayilan: mrm8488/t5-base-finetuned-wikiSQL)
+kullanarak calistirilabilir bir SQL ifadesine cevirir.
+
+ONEMLI NOT (Duzeltme):
+    Onceki surumde `transformers.pipeline(task="text2text-generation", ...)`
+    kullaniliyordu. Bazi transformers versiyonlarinda/ortamlarinda bu task
+    adi kayitli olmayabiliyor ve "Unknown task text2text-generation" hatasi
+    firlatiliyordu. Bu kirilgan pipeline soyutlamasindan kacinmak icin bu
+    surumde model ve tokenizer DOGRUDAN `AutoTokenizer` ve
+    `AutoModelForSeq2SeqLM` ile yuklenip `model.generate()` manuel olarak
+    cagriliyor. Bu yaklasim hem daha guvenilir hem de transformers
+    versiyonlarindan bagimsizdir.
+
+Sorumluluklar (Single Responsibility Principle):
+    - Modeli ve tokenizer'i ilk calistirmada indirip yerel onbellege
+      (cache) almak ve sonraki calistirmalarda onbellekten yuklemek.
+    - Dogal dil girdisini modelin bekledigi prompt formatina donusturmek.
+    - Tokenizer ile girdiyi tensore cevirip model.generate() ile SQL
+      token dizisi uretmek.
+    - Uretilen token dizisini decode edip temizleyerek calistirilabilir,
+      tek satirlik bir SQL string'ine cevirmek.
+    - `transformers` / `torch` gibi agir bagimliliklar kurulu degilse veya
+      model indirilemiyorsa (ornegin internet baglantisi yoksa) programin
+      COKMESINI ENGELLEMEK; bunun yerine anlamli bir hata/durum bildirmek.
+
+Bu sinif SQL'in GECERLI olup olmadigini dogrulamaz; uretilen SQL, dogrulama
+icin 1. modul olan SQLEngineParser'a gonderilmelidir.
+"""
+
 from __future__ import annotations
 
 import re
@@ -12,14 +49,14 @@ from typing import Any
 # edebilmelidir.
 # --------------------------------------------------------------------------
 try:
-    from transformers import pipeline, Pipeline  # type: ignore
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     _TRANSFORMERS_AVAILABLE = True
     _IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # ImportError, ModuleNotFoundError veya baska sorunlar
     _TRANSFORMERS_AVAILABLE = False
     _IMPORT_ERROR = exc
-    Pipeline = Any  # type: ignore  # Tip belirtimi bozulmasin diye fallback.
 
 
 class AITranslatorError(Exception):
@@ -42,6 +79,10 @@ class AITranslator:
     veri kumesi uzerinde egitilmis, CPU uzerinde makul hizda calisabilen
     hafif bir T5 modelidir. Farkli bir model kullanmak istenirse
     `model_name` parametresi ile degistirilebilir.
+
+    Model ve tokenizer, kirilgan `pipeline()` soyutlamasi yerine dogrudan
+    `AutoTokenizer` ve `AutoModelForSeq2SeqLM` ile yuklenir; ceviri
+    `model.generate()` metodu manuel olarak cagrilarak yapilir.
     """
 
     DEFAULT_MODEL_NAME = "mrm8488/t5-base-finetuned-wikiSQL"
@@ -56,15 +97,17 @@ class AITranslator:
         self.model_name = model_name or self.DEFAULT_MODEL_NAME
         self.max_new_tokens = max_new_tokens
 
-        self._pipeline: Pipeline | None = None
+        self._tokenizer: Any | None = None
+        self._model: Any | None = None
         self.is_available: bool = False
         self._unavailable_reason: str | None = None
 
-        self._initialize_pipeline()
+        self._initialize_model()
 
-    def _initialize_pipeline(self) -> None:
+    def _initialize_model(self) -> None:
         """
-        Text-to-SQL pipeline'ini yukler.
+        Tokenizer'i ve Seq2Seq modelini dogrudan `AutoTokenizer` /
+        `AutoModelForSeq2SeqLM` ile yukler.
 
         Model ilk calistirmada Hugging Face Hub'dan indirilip yerel
         onbellege (varsayilan olarak `~/.cache/huggingface`) kaydedilir;
@@ -98,19 +141,22 @@ class AITranslator:
         )
 
         try:
-            self._pipeline = pipeline(
-                task="text2text-generation",
-                model=self.model_name,
-                tokenizer=self.model_name,
-                device=-1,  # -1: CPU uzerinde calistir (GPU zorunlulugu yok).
-            )
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+            # Modeli degerlendirme (inference) moduna alir; dropout gibi
+            # egitim-ozel katmanlar devre disi kalir, sonuclar tutarli olur.
+            self._model.eval()
+
             self.is_available = True
             print(f"[AITranslator] Model basariyla yuklendi. Hazir. ✔")
         except Exception as exc:
             # Internet baglantisi olmamasi, model adinin hatali olmasi,
-            # disk alani sorunlari vb. tum senaryolar burada yakalanir.
+            # disk alani sorunlari, versiyon uyumsuzluklari vb. tum
+            # senaryolar burada yakalanir.
             self.is_available = False
-            self._unavailable_reason = f"Model yuklenemedi: {exc}"
+            self._tokenizer = None
+            self._model = None
+            self._unavailable_reason = f"Model/tokenizer yuklenemedi: {exc}"
             print(
                 f"[AITranslator] HATA: Model yuklenemedi, AI ceviri ozelligi "
                 f"devre disi birakildi. Detay: {exc}",
@@ -169,6 +215,14 @@ class AITranslator:
         """
         Dogal dilde yazilmis bir istegi calistirilabilir bir SQL ifadesine cevirir.
 
+        Bu metod, `pipeline()` soyutlamasi yerine tokenizer ve modeli
+        dogrudan kullanir:
+            1. Prompt olusturulur.
+            2. Tokenizer ile prompt tensore (input_ids) cevirilir.
+            3. `model.generate()` ile cikti token dizisi uretilir.
+            4. Tokenizer ile cikti tekrar okunabilir metne (decode) cevirilir.
+            5. Metin temizlenip calistirilabilir SQL formatina getirilir.
+
         Args:
             natural_language_text: Kullanicinin Turkce veya Ingilizce olarak
                 yazdigi dogal dil istegi.
@@ -179,12 +233,13 @@ class AITranslator:
 
         Raises:
             AITranslatorError: Model kullanilabilir degilse (kutuphane eksikse
-                veya yukleme basarisiz olduysa) ya da girdi bos ise.
+                veya yukleme basarisiz olduysa) ya da girdi bos ise ya da
+                uretim/decode sirasinda bir hata olusursa.
         """
         if not natural_language_text or not natural_language_text.strip():
             raise AITranslatorError("Cevrilecek metin bos olamaz.")
 
-        if not self.is_available or self._pipeline is None:
+        if not self.is_available or self._model is None or self._tokenizer is None:
             raise AITranslatorError(
                 "AI ceviri ozelligi su anda kullanilamiyor. "
                 f"Neden: {self._unavailable_reason}"
@@ -193,19 +248,30 @@ class AITranslator:
         prompt = self._build_prompt(natural_language_text)
 
         try:
-            generation_result = self._pipeline(
+            # Tokenizer ile prompt'u model girdisine (tensor) cevirir.
+            input_ids = self._tokenizer(
                 prompt,
-                max_new_tokens=self.max_new_tokens,
-                num_beams=4,
-                early_stopping=True,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            ).input_ids
+
+            # Gradyan hesaplamasini kapatarak (inference-only) bellek ve
+            # hiz acisindan daha verimli calistiriyoruz.
+            with torch.no_grad():
+                output_token_ids = self._model.generate(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    num_beams=4,
+                    early_stopping=True,
+                )
+
+            raw_text = self._tokenizer.decode(
+                output_token_ids[0], skip_special_tokens=True
             )
         except Exception as exc:
             raise AITranslatorError(f"Ceviri sirasinda bir hata olustu: {exc}") from exc
 
-        if not generation_result:
-            raise AITranslatorError("Model bos bir sonuc dondurdu.")
-
-        raw_text = generation_result[0].get("generated_text", "")
         sql_query = self._post_process_sql(raw_text)
 
         if not sql_query:
