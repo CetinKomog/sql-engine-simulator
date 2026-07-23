@@ -1,54 +1,38 @@
-# Advanced SQL Syntax Translation, Virtual Execution and Analytical Profiling Engine
+# Hybrid SQL Engine & AI Translator Simulator
 
-A modular, high-performance SQL Engine Simulator designed to demonstrate relational database theory, compiler design principles, analytical profiling, and experimental localized NLP model integration. 
+This project is a Python-based simulator designed to parse SQL queries, perform dialect translations (e.g., PostgreSQL, MSSQL, Oracle), execute queries against an in-memory database with synthetic data, and translate natural language inputs into SQL using a local machine learning model.
 
-This project is built using Object-Oriented Programming (OOP) paradigms in Python to serve as a comprehensive software engineering portfolio.
+## Features
 
----
+- **SQL-to-SQL Translation:** Parses and translates queries across different veritabanı lehçeleri using `sqlglot`.
+- **Natural Language to SQL (Text-to-SQL):** Integrates a local Hugging Face Seq2Seq model (`transformers`) to generate SQL queries from plain text inputs.
+- **In-Memory Database Execution:** Generates mock datasets using `Faker` and executes queries dynamically in memory via `sqlite3`.
+- **Data Analytics & Export:** Processes query execution results with `pandas` to generate performance metrics and automatic CSV reports.
+- **CLI Interface:** Provides a unified command-line entry point to run both standard dialect translations and AI-assisted query generation.
 
-## Architecture and Core Modules
+## Project Architecture
 
-The system is decoupled into five distinct functional modules to ensure strict adherence to the Single Responsibility Principle:
+- `parser_engine.py`: Core SQL parsing and dialect conversion logic.
+- `database_executor.py`: Mock data generation and in-memory execution pipeline.
+- `data_analyzer.py`: Analytical processing, metrics logging, and report exporting.
+- `ai_translator.py`: Local Hugging Face pipeline for natural language to SQL translation.
+- `main.py`: Command-line orchestrator connecting all modules.
 
-1. **`parser_engine.py` (The Parser Layer)**
-   * Syntactic validation of incoming raw terminal inputs.
-   * Leverages `sqlglot` to parse valid SQL statements into an Abstract Syntax Tree (AST).
-   * Translates queries seamlessly across different SQL dialects (PostgreSQL, T-SQL, MySQL, Oracle).
-   * Renders the hierarchical syntax tree to the terminal via the `--ast` parameter.
+## Requirements
 
-2. **`database_executor.py` (The Database & Simulation Layer)**
-   * Initializes a temporary, lightweight relational database completely in memory (`sqlite3`).
-   * Automatically provisions schemas and seed data for `Personel` and `Yemekler` tables.
-   * Executes valid DDL and DML queries in a transaction-safe environment.
-   * Features a scalable data generator (`--scale N`) powered by `Faker` to populate the tables with realistic Turkish test data.
-
-3. **`data_analyzer.py` (The Analytical & Logging Layer)**
-   * Converts SQL result matrices into `pandas` DataFrames for statistical profiling.
-   * Extracts quantitative summaries (`--profile`) including mean, standard deviation, min, max, and missing value counts for numeric columns.
-   * Measures execution time at microsecond precision and logs transaction history to `sql_engine_history.log`.
-   * Exports analytical query results directly into `.csv` files using the `--export` parameter.
-
-4. **`ai_translator.py` (The Experimental Machine Learning Layer)**
-   * Integrates a localized Sequence-to-Sequence (Seq2Seq) Transformer model (`t5-small`) via Hugging Face `transformers`.
-   * Triggered optionally with the `--ai` flag to perform syntax translations, highlighting deep learning integration in data workflows without impacting core execution speeds.
-
-5. **`main.py` (The User Interface Layer)**
-   * Consolidates all modules into a unified Command Line Interface (CLI).
-   * Employs the `rich` library to render color-coded, tabular, and highly readable execution logs directly on the terminal.
-
----
-
-## Technical Specifications & Features
-
-* **Error Handling:** Invalid terminal inputs are captured gracefully via a custom `NotASQLError` exception, ensuring system stability.
-* **Deterministic vs. Stochastic Translation:** Combines high-speed rule-based AST translation (default) with deep learning-based translation (optional AI).
-* **High-Volume Data Testing:** Enables simulated performance testing by populating thousands of rows instantly in memory.
-
----
-
-## Installation
-
-Ensure Python 3.10 or higher is installed. Install the necessary packages using the terminal:
+Ensure all required dependencies are installed:
 
 ```bash
-pip install sqlglot rich faker pandas transformers torch
+pip install torch transformers sqlglot pandas faker
+
+Usage
+Standard Mode (SQL-to-SQL)
+Convert an existing SQL query to a target dialect and execute it against mock data:
+
+python main.py --query "SELECT * FROM users WHERE age > 25" --target-dialect mssql
+
+AI Mode (Text-to-SQL)
+Generate an SQL query from plain text and execute it:
+
+python main.py --query "show all employees with salary over 50000" --ai
+
